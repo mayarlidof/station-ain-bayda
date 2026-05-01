@@ -1,5 +1,5 @@
 import dash
-from dash import dcc, html, Input, Output, State, dash_table
+from dash import dcc, html, Input, Output, State, dash_table, callback_context
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -32,7 +32,7 @@ def check_alerts(row):
     """Vérifie si une ligne déclenche des alertes."""
     alerts = []
     for col, seuils in SEUILS.items():
-        if col in row:  # Vérifie que la colonne existe
+        if col in row:
             value = row[col]
             if value < seuils["min"]:
                 alerts.append(f"⚠️ {col} : Trop bas ({value} < {seuils['min']})")
@@ -44,11 +44,9 @@ def check_alerts(row):
 def calculate_statistics(data):
     """Calcule les statistiques pour les colonnes numériques uniquement."""
     dff = pd.DataFrame(data)
-    # Filtrer les colonnes numériques (exclure Timestamp et autres non-numériques)
     numeric_cols = dff.select_dtypes(include=[np.number]).columns.tolist()
     if not numeric_cols:
-        return pd.DataFrame()  # Retourne un DataFrame vide si aucune colonne numérique
-
+        return pd.DataFrame()
     stats = dff[numeric_cols].describe().round(2)
     stats.loc["Écart-type"] = dff[numeric_cols].std().round(2)
     return stats
@@ -65,10 +63,47 @@ def predict_next_value(data, column_name, steps=1):
     next_X = np.array([[len(dff) + steps]])
     return model.predict(next_X)[0]
 
+def reset_data():
+    """Réinitialise les données à leur état initial."""
+    global df
+    df = pd.DataFrame({
+        "Timestamp": [datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+        "Réservoir 3000m³ (Niveau)": [10.0],
+        "Réservoir 2500m³ (Niveau)": [8.0],
+        "F Ain Bieda 01 (Pression)": [2.0],
+        "DN 160 (Débit)": [150.0],
+    })
+    return df.to_dict("records")
+
 # --- Layout de l'application ---
 app.layout = html.Div([
     # Titre
     html.H1("📊 Tableau de bord - Station Ain Bieda", style={"textAlign": "center", "marginBottom": "20px"}),
+
+    # Boutons de contrôle
+    html.Div([
+        html.Button("🔄 Initialiser", id="btn_reset", style={
+            "margin": "10px",
+            "padding": "10px 20px",
+            "backgroundColor": "#f44336",
+            "color": "white",
+            "border": "none",
+            "borderRadius": "5px",
+            "cursor": "pointer",
+            "fontSize": "16px"
+        }),
+        html.Button("📥 Exporter en Excel", id="btn_export", style={
+            "margin": "10px",
+            "padding": "10px 20px",
+            "backgroundColor": "#4CAF50",
+            "color": "white",
+            "border": "none",
+            "borderRadius": "5px",
+            "cursor": "pointer",
+            "fontSize": "16px"
+        }),
+        dcc.Download(id="download-excel"),
+    ], style={"textAlign": "center", "marginBottom": "20px"}),
 
     # Conteneur pour les alertes
     html.Div(id="alert-container", style={"margin": "10px", "padding": "15px", "backgroundColor": "#f8f9fa", "borderRadius": "5px"}),
@@ -99,20 +134,54 @@ app.layout = html.Div([
     html.H3("📊 Statistiques", style={"marginTop": "20px"}),
     html.Div(id="stats-table"),
 
-    # Bouton d'export
-    html.Div([
-        html.Button("📥 Exporter en Excel", id="btn_export", style={"margin": "10px", "padding": "10px 20px", "backgroundColor": "#4CAF50", "color": "white", "border": "none", "borderRadius": "5px", "cursor": "pointer"}),
-        dcc.Download(id="download-excel"),
-    ], style={"textAlign": "center", "marginTop": "20px"}),
+    # Store pour stocker les données (optionnel, pour éviter les conflits de callback)
+    dcc.Store(id="store-data", data=df.to_dict("records")),
 ])
 
 # --- Callbacks ---
-# Callback pour mettre à jour les données, alertes et prédictions
+# Callback pour le bouton Initialiser
 @app.callback(
     Output("table", "data"),
     Output("alert-container", "children"),
     Output("prediction-container", "children"),
+    Output("graph-niveaux", "figure"),
+    Output("graph-pression-debit", "figure"),
+    Output("stats-table", "children"),
+    Input("btn_reset", "n_clicks"),
+    prevent_initial_call=True,
+)
+def reset_all(n_clicks):
+    if n_clicks is None:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    # Réinitialiser les données
+    reset_data()
+
+    # Réinitialiser les composants
+    empty_alert = html.Div("✅ Aucun problème détecté", style={"color": "green", "fontWeight": "bold", "fontSize": "18px"})
+    empty_prediction = html.Div("⚠️ Pas assez de données pour prédire", style={"color": "orange"})
+    empty_stats = html.Div("⚠️ Pas assez de données pour calculer les statistiques", style={"textAlign": "center", "padding": "20px"})
+    empty_figure = go.Figure()
+
+    return (
+        df.to_dict("records"),
+        empty_alert,
+        empty_prediction,
+        empty_figure,
+        empty_figure,
+        empty_stats,
+    )
+
+# Callback pour mettre à jour les données, alertes et prédictions
+@app.callback(
+    Output("table", "data", allow_duplicate=True),
+    Output("alert-container", "children", allow_duplicate=True),
+    Output("prediction-container", "children", allow_duplicate=True),
+    Output("graph-niveaux", "figure", allow_duplicate=True),
+    Output("graph-pression-debit", "figure", allow_duplicate=True),
+    Output("stats-table", "children", allow_duplicate=True),
     Input("interval", "n_intervals"),
+    prevent_initial_call=True,
 )
 def update_data(n):
     try:
@@ -128,7 +197,7 @@ def update_data(n):
         global df
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
 
-        # Vérifier les alertes pour la nouvelle ligne
+        # Vérifier les alertes
         alerts = [check_alerts(row) for row in df.to_dict("records") if check_alerts(row) != "✅ Normal"]
         alert_div = (
             html.Div([
@@ -156,114 +225,84 @@ def update_data(n):
             else html.Div("⚠️ Pas assez de données pour prédire", style={"color": "orange"})
         )
 
-        return df.to_dict("records"), alert_div, prediction_div
-
-    except Exception as e:
-        return dash.no_update, html.Div(f"❌ Erreur : {str(e)}", style={"color": "red"}), dash.no_update
-
-# Callback pour le graphique des niveaux
-@app.callback(
-    Output("graph-niveaux", "figure"),
-    Input("table", "data"),
-)
-def update_niveaux_graph(data):
-    try:
-        dff = pd.DataFrame(data)
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=dff["Timestamp"],
-            y=dff["Réservoir 3000m³ (Niveau)"],
+        # Graphiques
+        fig_niveaux = go.Figure()
+        fig_niveaux.add_trace(go.Scatter(
+            x=df["Timestamp"],
+            y=df["Réservoir 3000m³ (Niveau)"],
             name="Réservoir 3000m³",
             line=dict(color="blue"),
         ))
-        fig.add_trace(go.Scatter(
-            x=dff["Timestamp"],
-            y=dff["Réservoir 2500m³ (Niveau)"],
+        fig_niveaux.add_trace(go.Scatter(
+            x=df["Timestamp"],
+            y=df["Réservoir 2500m³ (Niveau)"],
             name="Réservoir 2500m³",
             line=dict(color="green"),
         ))
-        fig.update_layout(
+        fig_niveaux.update_layout(
             title="Évolution des niveaux des réservoirs",
             xaxis_title="Temps",
             yaxis_title="Niveau (m)",
             hovermode="x unified",
         )
-        return fig
-    except Exception as e:
-        return go.Figure()  # Retourne un graphique vide en cas d'erreur
 
-# Callback pour le graphique pression/débit
-@app.callback(
-    Output("graph-pression-debit", "figure"),
-    Input("table", "data"),
-)
-def update_pression_debit_graph(data):
-    try:
-        dff = pd.DataFrame(data)
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=dff["Timestamp"],
-            y=dff["F Ain Bieda 01 (Pression)"],
+        fig_pression_debit = go.Figure()
+        fig_pression_debit.add_trace(go.Scatter(
+            x=df["Timestamp"],
+            y=df["F Ain Bieda 01 (Pression)"],
             name="Pression Filtre 01",
             line=dict(color="red"),
         ))
-        fig.add_trace(go.Scatter(
-            x=dff["Timestamp"],
-            y=dff["DN 160 (Débit)"],
+        fig_pression_debit.add_trace(go.Scatter(
+            x=df["Timestamp"],
+            y=df["DN 160 (Débit)"],
             name="Débit DN160",
             line=dict(color="purple"),
             yaxis="y2",
         ))
-        fig.update_layout(
+        fig_pression_debit.update_layout(
             title="Pression et Débit",
             xaxis_title="Temps",
             yaxis=dict(title="Pression (bar)", side="left"),
             yaxis2=dict(title="Débit (m³/h)", overlaying="y", side="right"),
             hovermode="x unified",
         )
-        return fig
-    except Exception as e:
-        return go.Figure()  # Retourne un graphique vide en cas d'erreur
 
-# Callback pour les statistiques (CORRIGÉ)
-@app.callback(
-    Output("stats-table", "children"),
-    Input("table", "data"),
-)
-def update_stats(data):
-    if not data or len(data) < 2:
-        return html.Div("⚠️ Pas assez de données pour calculer les statistiques", style={"textAlign": "center", "padding": "20px"})
+        # Statistiques
+        if len(df) >= 2:
+            stats = calculate_statistics(df.to_dict("records"))
+            if not stats.empty:
+                stats_table = dash_table.DataTable(
+                    data=stats.reset_index().to_dict("records"),
+                    columns=[{"name": col, "id": col} for col in stats.reset_index().columns],
+                    style_cell={"textAlign": "left", "padding": "10px", "fontFamily": "Arial"},
+                    style_header={"backgroundColor": "rgb(230, 230, 230)", "fontWeight": "bold", "border": "1px solid rgb(200, 200, 200)"},
+                    style_data_conditional=[{"if": {"row_index": "odd"}, "backgroundColor": "rgb(248, 248, 248)"}],
+                )
+                stats_div = html.Div([html.H4("Statistiques des capteurs"), stats_table])
+            else:
+                stats_div = html.Div("⚠️ Aucune colonne numérique trouvée pour les statistiques", style={"textAlign": "center", "padding": "20px"})
+        else:
+            stats_div = html.Div("⚠️ Pas assez de données pour calculer les statistiques", style={"textAlign": "center", "padding": "20px"})
 
-    try:
-        stats = calculate_statistics(data)
-        if stats.empty:
-            return html.Div("⚠️ Aucune colonne numérique trouvée pour les statistiques", style={"textAlign": "center", "padding": "20px"})
-
-        # Convertir en tableau Dash
-        stats_table = dash_table.DataTable(
-            data=stats.reset_index().to_dict("records"),
-            columns=[{"name": col, "id": col} for col in stats.reset_index().columns],
-            style_cell={
-                "textAlign": "left",
-                "padding": "10px",
-                "fontFamily": "Arial",
-            },
-            style_header={
-                "backgroundColor": "rgb(230, 230, 230)",
-                "fontWeight": "bold",
-                "border": "1px solid rgb(200, 200, 200)",
-            },
-            style_data_conditional=[
-                {
-                    "if": {"row_index": "odd"},
-                    "backgroundColor": "rgb(248, 248, 248)",
-                }
-            ],
+        return (
+            df.to_dict("records"),
+            alert_div,
+            prediction_div,
+            fig_niveaux,
+            fig_pression_debit,
+            stats_div,
         )
-        return html.Div([html.H4("Statistiques des capteurs"), stats_table])
 
     except Exception as e:
-        return html.Div(f"❌ Erreur lors du calcul des statistiques : {str(e)}", style={"color": "red", "textAlign": "center"})
+        return (
+            dash.no_update,
+            html.Div(f"❌ Erreur : {str(e)}", style={"color": "red"}),
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+        )
 
 # Callback pour l'export Excel
 @app.callback(
@@ -277,8 +316,8 @@ def export_excel(n_clicks, data):
         dff = pd.DataFrame(data)
         return dcc.send_data_frame(dff.to_excel, "données_station_ain_bieda.xlsx", index=False)
     except Exception as e:
-        return None  # Évite les erreurs si l'export échoue
+        return None
 
 # Lancer l'application
 if __name__ == "__main__":
-    app.run_server(host="0.0.0.0", port=int(os.environ.get("PORT", 8050)))
+    app.run(debug=True)
